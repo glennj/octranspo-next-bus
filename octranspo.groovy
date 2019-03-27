@@ -1,3 +1,4 @@
+// https://github.com/jgritman/httpbuilder/wiki/RESTClient 
 @Grab('org.codehaus.groovy.modules.http-builder:http-builder:0.7')
 @Grab('oauth.signpost:signpost-core:1.2.1.2')
 @Grab('oauth.signpost:signpost-commonshttp4:1.2.1.2')
@@ -7,150 +8,162 @@ import groovyx.net.http.*
 import groovyx.net.http.RESTClient
 import static groovyx.net.http.ContentType.*
 import groovy.json.JsonOutput
-import groovy.inspect.*
+import groovy.json.JsonSlurper
+import groovy.xml.XmlUtil
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
-/** ********************************************************************** 
+/** **********************************************************************
  * OCTranspo.groovy
  *
  * Given an array of interesting bus stops, send REST queries to octranspo1.com
  * to retrieve the next few arrivals
+ *
  */
+// Ref: http://www.octranspo.com/developers/documentation
 
-class OCTranspo {
+def ENV = System.getenv()
+def config_dir = ENV.containsKey('XDG_CONFIG_HOME') ? ENV['XDG_CONFIG_HOME'] : ENV['HOME'] + '/.config'
+def config_file = new File(config_dir, 'octranspo.json')
 
-    static app_id = '****'
-    static api_key = '****'
-    static url = 'https://api.octranspo1.com'
-    static url_path = '/v1.2/GetNextTripsForStop'
-    static interesting_stops = [
-        [stop: 7401, routes: [
-            [number: 2, direction: 'Westbound'],
-            [number: 16, direction: 'Westbound'],
-        ]],
-        [stop: 3012, routes: [
-            [number: 87, direction: 'Northbound']
-        ]],
-    ]
+def cli = new CliBuilder( usage: "${this.class.getName()} [-options]" )
+cli.H(longOpt: 'home',  'show buses from home stops')
+cli.W(longOpt: 'work',  'show buses from work stops')
+cli.d(longOpt: 'debug', 'show raw XML')
+cli.h(longOpt: 'help',  'show help text')
+cli.v(longOpt: 'verbose',  'show some verbose information')
 
-    def debug = false
+def options = cli.parse(args)
 
-    /**
-     * The entry point
-     */
-    static void main(String... args) {
-        def obj = new OCTranspo2()
-        def options = obj.parseArgs(args)
-        obj.setDebug options.debug
+if (options.help) {
+    println 'OCTranspo bus arrivals for some stops.'
+    cli.usage()
+    println """
+The bus routes to be queried are to be configured in ${config_file.getPath()}
+That file contains a JSON object consisting of:
+    * key "auth" is an object containing the appID and apiKey
+    * key "buses" is an object containing a list of objects,
+        * each object has keys "stop", "from" and "routes",
+        * "routes" is a list of objects with keys "number" and "direction".
 
-        if (options.verbose || options.debug) {
-            println JsonOutput.prettyPrint( JsonOutput.toJson( this.interesting_stops ))
-            println ""
-        }
-
-        obj.findNextBuses()
-    }
-
-    def setDebug(value) { this.debug = value }
-
-    /** 
-     * Parse the command line arguments
-     *
-     * @param args the array of arguments
-     * @return an OptionAccessor object
-     */
-    def parseArgs(String... args) {
-        def cli = new CliBuilder( usage: 'groovy ' + this.class.getName() + ' [-options]')
-        cli.d(longOpt: 'debug', 'show raw XML')
-        cli.v(longOpt: 'verbose',  'show some verbose information')
-        cli.h(longOpt: 'help',  'show help text')
-        def options = cli.parse(args)
-        if (options.help) {
-            println 'OCTranspo bus arrivals for some stops'
-            cli.usage()
-            System.exit 0
-        }
-
-        return options
-    }
-
-    /**
-     * Loop over the list of interesting bus stops
-     * and extract the next arrivals for the declared routes
-     *
-     * @return null
-     */
-    def findNextBuses() {
-        def http = new RESTClient( this.url )
-
-        this.interesting_stops.each { stop ->
-            stop.routes.each { route ->
-                def params = [
-                    appID: this.app_id,
-                    apiKey: this.api_key,
-                    stopNo: stop.stop,
-                    routeNo: route.number,
-                ]
-
-                this.debug 
-                    ? dump_xml(http, params)
-                    : get_stops(http, params, route.direction) 
-            }
+For example:
+    {
+        "auth": {"appID": 1234, "apiKey": "deadbeef"},
+        "buses": {
+            [
+                {"stop": 7401, "from": "work", "routes": [{"number": 16, "direction": "Westbound"}]},
+                {"stop": 3012, "from": "work", "routes": [
+                    {"number": 11, "direction": "Westbound"},
+                    {"number": 87, "direction": "Northbound"}
+                ]},
+                {"stop": 4960, "from": "home", "routes": [
+                    { "number": 11, "direction": "Eastbound" },
+                    { "number": 16, "direction": "Eastbound" },
+                    { "number": 87, "direction": "Southbound" }
+                ]}
+            ]
         }
     }
+"""
+    System.exit 0
+}
 
-    /**
-     * Extract the next stop times from the returned XML
-     *
-     * @params http a RESTClient object
-     * @params params the necessary parameters
-     * @params direction the expected direction of the bus route
-     * @return null
-     */
-    def get_stops(http, params, direction) {
-        http.post( path: this.url_path, body: params, requestContentType: URLENC ) { resp, xml ->
-            assert resp.status == 200
-            def routeno, dir
-            xml.depthFirst().each { node ->
-                switch ( node.name() ) {
-                    case "STOPLABEL":
-                        println "Stop: $node"
-                        break
-                    case "ROUTEDIRECTION":
-                        routeno = node.ROUTENO
-                        dir = node.DIRECTION
-                        break
-                    case "TRIP":
-                        if (dir == direction) {
-                            println "$routeno ${node.TRIPDESTINATION} in ${node.ADJUSTEDSCHEDULETIME} minutes"
+assert (config_file.exists() && config_file.isFile())
+
+def config = new JsonSlurper().parse(new FileReader(config_file))
+assert config.containsKey('auth')
+
+def params = config.auth
+assert params.containsKey('appID') && params.containsKey('apiKey')
+
+
+def formatter = DateTimeFormatter.ofPattern('E d MMM Y, h:mm:ss a')
+def today = LocalDateTime.now().format(formatter)
+println "At $today:\n"
+
+if (options.verbose || options.debug) {
+    println JsonOutput.prettyPrint( JsonOutput.toJson( config.buses ))
+    println ""
+}
+
+/* *** global vars *** */
+url = 'https://api.octranspo1.com'
+url_path = '/v1.2/GetNextTripsForStop'
+http = new RESTClient( url )
+
+config.buses
+    .findAll {
+        (options.home && it.from == "home") ||
+        (options.work && it.from == "work") ||
+        !(options.home ^ options.work)
+    }
+    .each { stop ->
+        stop.routes.each { route ->
+            params.stopNo = stop.stop
+            params.routeNo = route.number
+            options.debug ?
+                dump_trips(params) :
+                print_trips(route, params)
+        }
+    }
+
+/* ********************************************************* */
+def print_trips(route, params) {
+    http.post( path: url_path, body: params, requestContentType: URLENC ) { resp, xml ->
+        assert resp.status == 200
+        def routeno, dir, stop
+        def seen = false
+        xml.depthFirst().each { node ->
+            switch ( node.name() ) {
+                case "STOPLABEL":
+                    //println "Stop: $node"
+                    stop = node.text()
+                    break
+                case "ROUTEDIRECTION":
+                    routeno = node.ROUTENO.text()
+                    dir = node.DIRECTION.text()
+                    if (!seen) {
+                        println "$routeno $stop"
+                        seen = true
+                    }
+                    break
+                case "TRIP":
+                    if (dir == route.direction) {
+                        def dest = node.TRIPDESTINATION.text().replaceFirst(" / .*", "")
+                        def arrival = node.ADJUSTEDSCHEDULETIME.text()
+                        def bustype = node.BUSTYPE.text()
+                        def type
+                        switch (bustype.take(1)) {
+                            case "4": type = "short"; break
+                            case "6": type = "articulated"; break
+                            case "D": type = "double decker"; break
                         }
-                        break
-                }
+                        if (bustype.contains("B")) {
+                            type += " with bike rack"
+                        }
+                        //println "$routeno $dest in $arrival minutes ($type)"
+                        printf("   %3s min -> %s %s (%s)\n", arrival, routeno, dest, type)
+                    }
+                    break
             }
-            println ""
         }
-    }
-
-    /**
-     * Dump raw XML output
-     *
-     * @params http a RESTClient object
-     * @params params the necessary parameters
-     */
-    def dump_xml(http, params) {
-        def query = params.inject([]) {pairs, k, v -> pairs + "$k=$v"}.join("&") 
-        println "curl -d '${query}' ${this.url}${this.url_path}"
         println ""
-        http.post( 
-            path: this.url_path, 
-            body: params, 
-            requestContentType: URLENC,
-            contentType: TEXT,
-            headers: [Accept: 'application/xml'],
-        ) { resp, data ->
-            assert resp.status == 200
-            println data.getText()
-            println ""
-        }
     }
 }
 
+def dump_trips(params) {
+    def query = params.inject([]) {pairs, k, v -> pairs + "$k=$v"}.join("&")
+    println "curl -d '${query}' ${url}${url_path}"
+    println ""
+    http.post(
+        path: url_path,
+        body: params,
+        requestContentType: URLENC,
+        contentType: TEXT,
+        headers: [Accept: 'application/xml'],
+    ) { resp, data ->
+        assert resp.status == 200
+        println XmlUtil.serialize(data.getText())
+        println ""
+    }
+}
