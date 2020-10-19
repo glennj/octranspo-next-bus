@@ -118,6 +118,8 @@ end
 print_trip = function(routeno, trip)
   local dest = trip.TripDestination:gsub(" / .*", "")
   local arrival = trip.AdjustedScheduleTime
+  -- BusType might be an empty list in JSON
+  trip.BusType = type(trip.BusType) == "string" and trip.BusType or "?"
   local bus_type = trip.BusType:sub(1,1)
   if bus_type == "4"     then bus_type = "short"
   elseif bus_type == "6" then bus_type = "articulated"

@@ -76,6 +76,7 @@ assert config.containsKey('auth')
 def params = config.auth
 assert params.containsKey('appID') && params.containsKey('apiKey')
 
+params.format = 'json'
 
 def formatter = DateTimeFormatter.ofPattern('E d MMM Y, h:mm:ss a')
 def today = LocalDateTime.now().format(formatter)
@@ -88,7 +89,7 @@ if (options.verbose || options.debug) {
 
 /* *** global vars *** */
 url = 'https://api.octranspo1.com'
-url_path = '/v1.2/GetNextTripsForStop'
+url_path = '/v1.3/GetNextTripsForStop'
 http = new RESTClient( url )
 
 config.buses
@@ -109,6 +110,12 @@ config.buses
 
 /* ********************************************************* */
 def print_trips(route, params) {
+
+    /*
+     * TODO: rewrite to handle JSON data now that params
+     *       contains: format => 'json'
+     */
+
     http.post( path: url_path, body: params, requestContentType: URLENC ) { resp, xml ->
         assert resp.status == 200
         def routeno, dir, stop
@@ -163,7 +170,8 @@ def dump_trips(params) {
         headers: [Accept: 'application/xml'],
     ) { resp, data ->
         assert resp.status == 200
-        println XmlUtil.serialize(data.getText())
+        //println XmlUtil.serialize(data.getText())
+        println data.getText()
         println ""
     }
 }
